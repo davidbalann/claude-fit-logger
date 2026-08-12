@@ -15,14 +15,14 @@ You (phone) → Claude (chat + skill) → MCP server (Render)
                                           └─ Google Health API — the actual food log
 ```
 
-Full breakdown, including a diagram, in [`docs/architecture.tex`](docs/architecture.tex).
+Full breakdown, including a diagram, in [`docs/architecture.pdf`](docs/architecture.pdf).
 
 ## Status
 
 Working end-to-end: logging, automatic nutrition lookup with manual
 fallback, undo, remove, and running totals all sync correctly to the
 Google Health app. Single-user by design — see
-[`docs/security.tex`](docs/security.tex) for why that matters before
+[`docs/security.pdf`](docs/security.pdf) for why that matters before
 extending this to anyone else.
 
 ## Repository structure
@@ -45,12 +45,12 @@ claude-fit-logger/
 
 | Document | Covers |
 |---|---|
-| [`docs/install.tex`](docs/install.tex) | Full setup from scratch: Google Cloud, Neon, Render, Claude connector |
-| [`docs/architecture.tex`](docs/architecture.tex) | System design, data flow, component breakdown |
-| [`docs/api_reference.tex`](docs/api_reference.tex) | The four MCP tools: parameters and response shapes |
-| [`docs/operations.tex`](docs/operations.tex) | Deploying, rolling back, reconnecting the connector |
-| [`docs/troubleshooting.tex`](docs/troubleshooting.tex) | Known issues and fixes, including the Fit → Health migration |
-| [`docs/security.tex`](docs/security.tex) | Credential inventory and rotation procedures |
+| [`docs/install.pdf`](docs/install.pdf) | Full setup from scratch: Google Cloud, Neon, Render, Claude connector |
+| [`docs/architecture.pdf`](docs/architecture.pdf) | System design, data flow, component breakdown |
+| [`docs/api_reference.pdf`](docs/api_reference.pdf) | The four MCP tools: parameters and response shapes |
+| [`docs/operations.pdf`](docs/operations.pdf) | Deploying, rolling back, reconnecting the connector |
+| [`docs/troubleshooting.pdf`](docs/troubleshooting.pdf) | Known issues and fixes, including the Fit → Health migration |
+| [`docs/security.pdf`](docs/security.pdf) | Credential inventory and rotation procedures |
 
 ## Tech stack
 
@@ -59,7 +59,7 @@ Python (`fastmcp`, Starlette, uvicorn) · Render (hosting) · Neon (Postgres)
 
 ## Setup
 
-Start with [`docs/install.tex`](docs/install.tex) — it walks through every
+Start with [`docs/install.pdf`](docs/install.pdf) — it walks through every
 account, credential, and deployment step needed to stand this up from
 nothing.
 
