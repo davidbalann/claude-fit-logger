@@ -1,0 +1,8 @@
+.venv
+save_tokens.txt
+save_tokens_new.txt
+client_secret.json
+env.txt
+probe_nutrients.py
+__pycache__/
+*.pyc
