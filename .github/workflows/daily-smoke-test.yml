@@ -1,0 +1,27 @@
+name: Daily Smoke Test
+
+on:
+  schedule:
+    # 13:00 UTC = 9:00 AM Toronto (EDT/UTC-4) or 8:00 AM (EST/UTC-5)
+    - cron: '0 13 * * *'
+  workflow_dispatch: {}  # lets you also trigger it manually from the Actions tab
+
+jobs:
+  smoke-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - run: pip install httpx
+
+      - name: Run smoke test
+        env:
+          PUBLIC_BASE_URL: ${{ secrets.PUBLIC_BASE_URL }}
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
+        run: python scripts/daily_smoke_test.py
