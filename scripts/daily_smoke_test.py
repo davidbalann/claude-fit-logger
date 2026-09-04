@@ -34,14 +34,21 @@ def fail(msg: str):
 
 
 def check_server_health():
-    try:
-        r = httpx.get(f"{BASE_URL}/health", timeout=30)
-    except Exception as e:
-        fail(f"Server unreachable: {e}")
-        return
-    if r.status_code != 200 or r.text.strip() != "ok":
-        fail(f"Server /health returned {r.status_code}: {r.text[:200]}")
-    print("OK: server is reachable")
+    # Render's free tier can take 30-60+ seconds to wake from a cold start.
+    # Retry with a generous per-attempt timeout rather than failing on the
+    # first slow response.
+    last_error = None
+    for attempt in range(3):
+        try:
+            r = httpx.get(f"{BASE_URL}/health", timeout=90)
+            if r.status_code == 200 and r.text.strip() == "ok":
+                print("OK: server is reachable")
+                return
+            last_error = f"/health returned {r.status_code}: {r.text[:200]}"
+        except Exception as e:
+            last_error = str(e)
+        print(f"Attempt {attempt + 1} failed ({last_error}), retrying...")
+    fail(f"Server unreachable after 3 attempts: {last_error}")
 
 
 def get_access_token():
