@@ -6,3 +6,4 @@ env.txt
 probe_nutrients.py
 __pycache__/
 *.pyc
+.idea
