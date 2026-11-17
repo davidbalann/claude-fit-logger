@@ -129,7 +129,7 @@ def _usda_per_100g(food: dict):
     """Per-100g nutrients for one USDA food, or None when it has no kcal."""
     nutrients = [_normalize_usda_nutrient(n) for n in food.get("foodNutrients", []) if isinstance(n, dict)]
     kcal = _usda_kcal(nutrients)
-    if kcal is None:
+    if kcal is None or kcal < 0:
         return None
     per_100g = {"calories": kcal}
     for our_key, (names, numbers) in USDA_NUTRIENTS.items():
@@ -137,7 +137,9 @@ def _usda_per_100g(food: dict):
             if n["value"] is None or n["unit"] not in ("G", ""):
                 continue
             if n["name"] in names or n["number"] in numbers:
-                per_100g[our_key] = n["value"]
+                # "by difference" values can come out slightly negative (e.g.
+                # carbs -0.428). Google requires nutrient grams >= 0.
+                per_100g[our_key] = max(n["value"], 0.0)
                 break
     return per_100g
 
@@ -198,7 +200,7 @@ def _off_candidate(product: dict, fallback_name: str):
     n = product.get("nutriments") or {}
     kcal = _to_float(n.get("energy-kcal_100g"))
     code = product.get("code") or product.get("_id")
-    if kcal is None or not code:
+    if kcal is None or kcal < 0 or not code:
         return None  # kcal only; never fall back to energy_100g (kJ)
     per_100g = {
         "calories": kcal,
@@ -208,7 +210,8 @@ def _off_candidate(product: dict, fallback_name: str):
         "fiber_g": _to_float(n.get("fiber_100g")),
         "sugar_g": _to_float(n.get("sugars_100g")),
     }
-    per_100g = {k: v for k, v in per_100g.items() if v is not None}
+    per_100g = {k: (max(v, 0.0) if k != "calories" else v)
+                for k, v in per_100g.items() if v is not None}
     candidate = {
         "id": f"off:{code}",
         "name": product.get("product_name") or fallback_name,

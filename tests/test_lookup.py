@@ -208,3 +208,22 @@ def test_scale_candidate():
     assert scaled["calories"] == 249.0
     assert scaled["protein_g"] == 33.8
     assert scaled["fat_g"] == 0.0
+
+
+def test_negative_by_difference_nutrient_is_clamped_to_zero():
+    food = usda_food(8, "Chicken, breast, meat and skin, raw", [
+        n("Energy", 208, "KCAL", 127.0),
+        n("Carbohydrate, by difference", 205, "G", -0.428),
+        n("Protein", 203, "G", 21.4),
+    ])
+    cand = nl._usda_candidate(food)
+    assert cand["per_100g"]["carbs_g"] == 0.0
+    assert nl.scale_candidate(cand, 100)["carbs_g"] == 0.0
+
+
+def test_negative_kcal_is_skipped_and_off_negatives_clamped():
+    assert nl._usda_candidate(usda_food(3, "x", [n("Energy", 208, "KCAL", -5.0)])) is None
+    assert nl._off_candidate(off_product("1", "x", kcal=-1), "q") is None
+    p = off_product("2", "x", kcal=100)
+    p["nutriments"]["carbohydrates_100g"] = -0.2
+    assert nl._off_candidate(p, "q")["per_100g"]["carbs_g"] == 0.0
