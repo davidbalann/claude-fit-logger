@@ -162,7 +162,9 @@ def test_candidates_order_and_cap(monkeypatch):
     monkeypatch.setattr(nl.httpx, "get", fake_get)
     cands = nl.search_candidates("thing")
     assert len(cands) == 5
-    assert [c["source"] for c in cands] == ["usda", "usda", "usda", "off", "off"]
+    assert [c["source"] for c in cands] == ["usda", "usda", "usda", "usda", "off"]
+    # the 4th USDA hit (e.g. plain raw chicken breast) must not be cut
+    assert [c["id"] for c in cands][:4] == ["usda:1", "usda:2", "usda:3", "usda:4"]
 
 
 def test_off_tops_up_when_usda_is_empty(monkeypatch):

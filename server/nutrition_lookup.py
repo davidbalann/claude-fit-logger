@@ -31,7 +31,7 @@ log = logging.getLogger("claude-fit-logger.lookup")
 RETRY_DELAY_S = 1.0
 
 MAX_CANDIDATES = 5
-USDA_SHARE = 3  # of the 5 slots, USDA gets up to 3 first; OFF gets up to 2; leftovers top up
+USDA_SHARE = 4  # of the 5 slots, USDA gets up to 4 first; OFF gets up to 1; leftovers top up
 
 USDA_SEARCH_URL = "https://api.nal.usda.gov/fdc/v1/foods/search"
 USDA_FOOD_URL = "https://api.nal.usda.gov/fdc/v1/food"
