@@ -19,11 +19,15 @@ Required env vars:
     GOOGLE_REFRESH_TOKEN   (must be minted with the googlehealth.* scopes)
 """
 
+import json
+import logging
 import os
 import time
 import httpx
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+
+log = logging.getLogger("claude-fit-logger.health")
 
 TOKEN_URL = "https://oauth2.googleapis.com/token"
 BASE = "https://health.googleapis.com/v4/users/me/dataTypes/nutrition-log/dataPoints"
@@ -38,6 +42,27 @@ NUTRIENT_ENUM = {
 _cached_token = {"value": None, "expires_at": 0}
 
 
+class GoogleHealthError(RuntimeError):
+    """Raised on any non-2xx from Google. The message includes Google's body
+    so Claude sees the real reason in the tool error."""
+
+
+def _raise_for_google(r: httpx.Response, action: str, payload=None):
+    """Log and raise on non-2xx. Logs status, full response body and the JSON
+    payload we sent. Never logs headers, tokens, secrets or the request URL
+    query. `payload` is only ever the nutrition JSON (no credentials)."""
+    if r.is_success:
+        return
+    body = r.text
+    log.error("Google %s failed: status=%s", action, r.status_code)
+    log.error("Google %s response body: %s", action, body)
+    if payload is not None:
+        log.error("Google %s payload sent: %s", action, json.dumps(payload, sort_keys=True))
+    raise GoogleHealthError(
+        f"Google {action} failed with HTTP {r.status_code}. Google's error body: {body}"
+    )
+
+
 def _get_access_token() -> str:
     if _cached_token["value"] and time.time() < _cached_token["expires_at"] - 60:
         return _cached_token["value"]
@@ -48,7 +73,8 @@ def _get_access_token() -> str:
         "refresh_token": os.environ["GOOGLE_REFRESH_TOKEN"],
         "grant_type": "refresh_token",
     }, timeout=15)
-    resp.raise_for_status()
+    # Token endpoint error bodies (error, error_description) carry no secrets.
+    _raise_for_google(resp, "token refresh")
     data = resp.json()
     _cached_token["value"] = data["access_token"]
     _cached_token["expires_at"] = time.time() + data["expires_in"]
@@ -105,8 +131,9 @@ def write_nutrition(nutrients: dict, item_name: str, tz_name: str,
     if nutrient_list:
         log["nutrients"] = nutrient_list
 
-    r = httpx.post(BASE, headers=_headers(), json={"nutritionLog": log}, timeout=20)
-    r.raise_for_status()
+    payload = {"nutritionLog": log}
+    r = httpx.post(BASE, headers=_headers(), json=payload, timeout=20)
+    _raise_for_google(r, "nutrition write", payload)
     return r.json().get("response", {}).get("name", "")
 
 
@@ -117,7 +144,7 @@ def delete_nutrition(datapoint_name: str):
     r = httpx.post(f"{BASE}:batchDelete", headers=_headers(),
                    json={"names": [datapoint_name]}, timeout=20)
     if r.status_code not in (200, 404):
-        r.raise_for_status()
+        _raise_for_google(r, "nutrition delete", {"names": [datapoint_name]})
 
 
 def list_nutrition_today(tz_name: str):
@@ -134,5 +161,5 @@ def list_nutrition_today(tz_name: str):
         "endTime": end_local.astimezone(ZoneInfo("UTC")).strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
     r = httpx.get(BASE, headers=_headers(), params=params, timeout=20)
-    r.raise_for_status()
+    _raise_for_google(r, "nutrition list")
     return r.json()

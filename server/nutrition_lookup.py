@@ -8,8 +8,15 @@ Required env var:
     USDA_API_KEY   (free, from https://fdc.nal.usda.gov/api-key-signup)
 """
 
+import logging
 import os
+import time
 import httpx
+
+log = logging.getLogger("claude-fit-logger.lookup")
+
+# One retry after a short pause, then the source is treated as "no match".
+RETRY_DELAY_S = 1.0
 
 USDA_SEARCH_URL = "https://api.nal.usda.gov/fdc/v1/foods/search"
 OFF_SEARCH_URL = "https://world.openfoodfacts.org/cgi/search.pl"
@@ -26,6 +33,30 @@ USDA_NUTRIENT_ALIASES = {
 }
 
 
+def _get_json(source: str, url: str, **kwargs):
+    """GET url and return parsed JSON, or None if it failed twice.
+
+    Retries once after RETRY_DELAY_S on HTTP error status, timeout/network
+    error, or bad JSON. Each failure is logged at WARNING. Only the source
+    name, exception type and status are logged, never the URL or headers
+    (the URL can carry an API key)."""
+    for attempt in (1, 2):
+        try:
+            resp = httpx.get(url, **kwargs)
+            resp.raise_for_status()
+            return resp.json()
+        except httpx.HTTPStatusError as e:
+            reason = f"HTTP {e.response.status_code}"
+        except httpx.HTTPError as e:  # timeouts, connection errors
+            reason = type(e).__name__
+        except ValueError:  # bad JSON
+            reason = "invalid JSON"
+        log.warning("%s lookup failed (attempt %d/2): %s", source, attempt, reason)
+        if attempt == 1:
+            time.sleep(RETRY_DELAY_S)
+    return None
+
+
 def _lookup_usda(query: str):
     api_key = os.environ.get("USDA_API_KEY")
     if not api_key:
@@ -34,29 +65,34 @@ def _lookup_usda(query: str):
     # Prefer generic/whole-food data types over Branded products, since a
     # plain query like "chicken breast" should match the unprocessed food,
     # not some specific packaged/prepared item that happens to share the name.
-    resp = httpx.get(
-        USDA_SEARCH_URL,
+    # The key goes in a header, not the query string, so it never appears in
+    # request URLs (httpx logs URLs at INFO, and Render keeps those logs).
+    headers = {"X-Api-Key": api_key}
+    data = _get_json(
+        "USDA", USDA_SEARCH_URL,
         params={
             "query": query,
             "pageSize": 5,
-            "api_key": api_key,
             "dataType": ["Foundation", "SR Legacy"],
         },
+        headers=headers,
         timeout=10,
     )
-    resp.raise_for_status()
-    data = resp.json()
+    if data is None:
+        return None
     foods = data.get("foods", [])
 
     if not foods:
         # Fall back to any data type (including Branded) if nothing generic matched.
-        resp = httpx.get(
-            USDA_SEARCH_URL,
-            params={"query": query, "pageSize": 1, "api_key": api_key},
+        data = _get_json(
+            "USDA", USDA_SEARCH_URL,
+            params={"query": query, "pageSize": 1},
+            headers=headers,
             timeout=10,
         )
-        resp.raise_for_status()
-        foods = resp.json().get("foods", [])
+        if data is None:
+            return None
+        foods = data.get("foods", [])
 
     if not foods:
         return None
@@ -85,8 +121,8 @@ def _lookup_usda(query: str):
 
 
 def _lookup_off(query: str):
-    resp = httpx.get(
-        OFF_SEARCH_URL,
+    data = _get_json(
+        "Open Food Facts", OFF_SEARCH_URL,
         params={
             "search_terms": query,
             "search_simple": 1,
@@ -97,8 +133,8 @@ def _lookup_off(query: str):
         timeout=10,
         headers={"User-Agent": "claude-fit-logger/1.0"},
     )
-    resp.raise_for_status()
-    data = resp.json()
+    if data is None:
+        return None
     products = data.get("products", [])
     if not products:
         return None
@@ -126,6 +162,16 @@ def _lookup_off(query: str):
     }
 
 
+def _safe(source: str, fn, query: str):
+    """Last-resort guard: an unexpected parsing error in one source counts as
+    no match instead of crashing the tool call."""
+    try:
+        return fn(query)
+    except Exception as e:
+        log.warning("%s lookup crashed: %s", source, type(e).__name__)
+        return None
+
+
 def lookup_nutrition(item_name: str, quantity_g: float):
     """
     Returns a dict of nutrients scaled to quantity_g, or None if not found
@@ -137,7 +183,7 @@ def lookup_nutrition(item_name: str, quantity_g: float):
         "matched_name": "...", "source": "usda" | "off"
     }
     """
-    result = _lookup_usda(item_name) or _lookup_off(item_name)
+    result = _safe("USDA", _lookup_usda, item_name) or _safe("Open Food Facts", _lookup_off, item_name)
     if result is None:
         return None
 
