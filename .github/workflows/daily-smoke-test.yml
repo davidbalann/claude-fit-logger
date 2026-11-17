@@ -21,7 +21,5 @@ jobs:
       - name: Run smoke test
         env:
           PUBLIC_BASE_URL: ${{ secrets.PUBLIC_BASE_URL }}
-          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
-          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
-          GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
+          MCP_API_KEY: ${{ secrets.MCP_API_KEY }}
         run: python scripts/daily_smoke_test.py

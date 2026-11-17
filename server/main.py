@@ -67,33 +67,78 @@ def log_food(
     fat_g: float = None,
     fiber_g: float = None,
     sugar_g: float = None,
+    meal_type: str = None,
+    candidate_id: str = None,
 ) -> dict:
     """
-    Log a food item. Call with just item_name/quantity_g/tz first — this
-    tool will look the item up automatically. If it returns
-    status="not_found", compute the nutrition yourself and call this tool
-    again for the SAME item, this time also passing calories (required)
-    and any of protein_g/carbs_g/fat_g/fiber_g/sugar_g you can estimate.
+    Log a food item to Google Health. Three ways to call it:
+
+    1. Search: item_name, quantity_g, tz only. Returns status="candidates"
+       with up to 5 options (USDA first, then Open Food Facts). Each has an
+       id, name, source, data_type and per-100g calories/protein/carbs/fat/
+       fiber/sugar. Nothing is logged. Pick the best match for what the user
+       actually ate, then call again with that candidate's id.
+    2. Log a candidate: same item_name/quantity_g/tz plus candidate_id copied
+       from a candidates result. The server scales that food's per-100g values
+       to quantity_g and logs it with its true source ("usda" or "off").
+    3. Log your own numbers: item_name, quantity_g, tz plus calories (required)
+       and any of protein_g/carbs_g/fat_g/fiber_g/sugar_g. Use this for label
+       photos, restaurant items, or when status="not_found". Logged as
+       source="claude_estimate". If candidate_id is also given, candidate_id wins.
+
+    status="not_found" means no usable match (or the lookup sources were
+    unreachable): estimate the numbers yourself and use way 3.
+
+    meal_type is optional: BREAKFAST, LUNCH, DINNER or SNACK. If omitted it is
+    inferred from the local hour in tz.
 
     tz must be an IANA timezone name, e.g. "America/Toronto".
     """
-    if calories is None:
-        result = nutrition_lookup.lookup_nutrition(item_name, quantity_g)
-        if result is None:
+    if quantity_g is None or quantity_g <= 0:
+        raise ValueError("quantity_g must be greater than 0")
+
+    if candidate_id:
+        candidate = nutrition_lookup.get_candidate(candidate_id)
+        if candidate is None:
             return {
                 "status": "not_found",
                 "item_name": item_name,
                 "quantity_g": quantity_g,
                 "message": (
-                    "No match in USDA or Open Food Facts. Estimate calories "
-                    "(required) and macros, then call log_food again with "
-                    "the same item_name/quantity_g/tz plus those values."
+                    f"Could not load {candidate_id} (source unreachable or no kcal "
+                    "value). Search again, or estimate calories (required) and "
+                    "macros and call log_food with those values instead."
                 ),
             }
-        nutrients = {k: result.get(k, 0) for k in NUTRIENT_KEYS}
-        source = result["source"]
+        nutrients = nutrition_lookup.scale_candidate(candidate, quantity_g)
+        source = candidate["source"]
         estimated = False
-        matched_name = result["matched_name"]
+        matched_name = candidate["name"] or item_name
+    elif calories is None:
+        candidates = nutrition_lookup.search_candidates(item_name)
+        if not candidates:
+            return {
+                "status": "not_found",
+                "item_name": item_name,
+                "quantity_g": quantity_g,
+                "message": (
+                    "No usable match in USDA or Open Food Facts (or both were "
+                    "unreachable). Estimate calories (required) and macros, then "
+                    "call log_food again with the same item_name/quantity_g/tz "
+                    "plus those values."
+                ),
+            }
+        return {
+            "status": "candidates",
+            "item_name": item_name,
+            "quantity_g": quantity_g,
+            "candidates": candidates,
+            "message": (
+                "Nothing was logged. Pick the best match and call log_food again "
+                "with the same item_name/quantity_g/tz plus candidate_id. If none "
+                "fits, estimate the numbers yourself and pass calories instead."
+            ),
+        }
     else:
         nutrients = {
             "calories": calories,
@@ -108,7 +153,8 @@ def log_food(
         matched_name = item_name
 
     datapoint_name = health_client.write_nutrition(
-        nutrients, item_name=matched_name, tz_name=tz
+        nutrients, item_name=matched_name, tz_name=tz,
+        quantity_g=quantity_g, meal_type=meal_type,
     )
 
     entry_id = db.insert_entry(

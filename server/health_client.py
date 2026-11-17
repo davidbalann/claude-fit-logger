@@ -1,5 +1,5 @@
 """
-Google Health API (v4) client — replaces the legacy Google Fit client.
+Google Health API (v4) client, replaces the legacy Google Fit client.
 
 Writes nutrition logs as "anonymous food" entries (foodDisplayName + manual
 nutrient values), reads them back, and deletes them by resource name.
@@ -10,8 +10,18 @@ Notes on the schema, learned from Google's docs + empirical probing:
     PROTEIN, DIETARY_FIBER, SUGAR (confirmed accepted by the API).
   - startUtcOffset / endUtcOffset are REQUIRED. Omitting them makes Google
     assume UTC+0, which puts the entry on the wrong local day.
+  - serving.foodMeasurementUnit is REQUIRED (observed 2026-11-17: HTTP 400
+    "Required field 'serving.food_measurement_unit' is missing."). Google's
+    nutrition guide still shows an anonymous-food example with only
+    serving.amount, so the docs and the live API disagree. The value is a
+    string; the guide's identified-food example shows a resource name of the
+    form users/me/dataTypes/food-measurement-unit/dataPoints/<id>. [uncertain:
+    that the same format applies to anonymous foods, and the response shape of
+    the unit list, which is why _resolve_gram_unit logs the list on failure.]
+  - mealType must be one of BREAKFAST, LUNCH, DINNER, SNACK. We never send
+    MEAL_TYPE_UNSPECIFIED.
   - Anonymous-food logs cannot be edited after creation, only deleted and
-    re-created. That's fine — our undo/remove flow deletes.
+    re-created. That's fine, our undo/remove flow deletes.
 
 Required env vars:
     GOOGLE_CLIENT_ID
@@ -31,6 +41,7 @@ log = logging.getLogger("claude-fit-logger.health")
 
 TOKEN_URL = "https://oauth2.googleapis.com/token"
 BASE = "https://health.googleapis.com/v4/users/me/dataTypes/nutrition-log/dataPoints"
+UNIT_BASE = "https://health.googleapis.com/v4/users/me/dataTypes/food-measurement-unit/dataPoints"
 
 # our field name -> Google Health Nutrient enum name
 NUTRIENT_ENUM = {
@@ -39,7 +50,10 @@ NUTRIENT_ENUM = {
     "sugar_g": "SUGAR",
 }
 
+MEAL_TYPES = ("BREAKFAST", "LUNCH", "DINNER", "SNACK")
+
 _cached_token = {"value": None, "expires_at": 0}
+_unit_cache = {}
 
 
 class GoogleHealthError(RuntimeError):
@@ -92,18 +106,114 @@ def _offset_string(dt: datetime) -> str:
     return f"{int(offset.total_seconds())}s"
 
 
-def write_nutrition(nutrients: dict, item_name: str, tz_name: str,
-                    meal_type: str = "MEAL_TYPE_UNSPECIFIED") -> str:
-    """
-    Writes one nutrition log entry at the current local time.
+# --- meal type -------------------------------------------------------------
 
-    nutrients: dict with keys calories, protein_g, carbs_g, fat_g, fiber_g, sugar_g
-    tz_name:   IANA timezone, e.g. "America/Toronto"
-    Returns the created data point's resource name (used later to delete it).
+def infer_meal_type(hour: int) -> str:
+    """Default meal type from the local hour (0-23). Never returns UNSPECIFIED."""
+    if 5 <= hour < 11:
+        return "BREAKFAST"
+    if 11 <= hour < 15:
+        return "LUNCH"
+    if 17 <= hour < 21:
+        return "DINNER"
+    return "SNACK"  # 15:00-16:59 and 21:00-04:59
+
+
+def resolve_meal_type(meal_type, now_local: datetime) -> str:
+    """Validate an explicit meal_type, or infer one from the local hour."""
+    if meal_type is None or str(meal_type).strip() == "":
+        return infer_meal_type(now_local.hour)
+    value = str(meal_type).strip().upper()
+    if value not in MEAL_TYPES:
+        raise ValueError(
+            f"meal_type must be one of {', '.join(MEAL_TYPES)} (got {meal_type!r})"
+        )
+    return value
+
+
+# --- food measurement unit (gram) ------------------------------------------
+
+def _iter_strings(obj):
+    if isinstance(obj, str):
+        yield obj
+    elif isinstance(obj, dict):
+        for v in obj.values():
+            yield from _iter_strings(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            yield from _iter_strings(v)
+
+
+def _find_gram_unit(data_points) -> str:
+    """Pick the resource name of the 'gram' unit from a unit list. Returns ''
+    if none matches. A data point matches when any string in it, or the last
+    segment of its resource name, is exactly gram/grams/g (case-insensitive)."""
+    wanted = {"gram", "grams", "g"}
+    for dp in data_points or []:
+        if not isinstance(dp, dict):
+            continue
+        name = dp.get("name") if isinstance(dp.get("name"), str) else ""
+        candidates = [s.strip().lower() for s in _iter_strings(dp)]
+        if name:
+            candidates.append(name.rsplit("/", 1)[-1].strip().lower())
+        if wanted.intersection(candidates) and name:
+            return name
+    return ""
+
+
+def _resolve_gram_unit() -> str:
+    """Looks up (and caches) the resource name of the 'gram' food measurement
+    unit, required by serving.foodMeasurementUnit."""
+    if _unit_cache.get("gram"):
+        return _unit_cache["gram"]
+
+    headers = _headers()
+    data_points = []
+    page_token = None
+    for _ in range(20):
+        params = {"pageToken": page_token} if page_token else None
+        r = httpx.get(UNIT_BASE, headers=headers, params=params, timeout=20)
+        _raise_for_google(r, "food measurement unit list")
+        body = r.json()
+        data_points.extend(body.get("dataPoints", []))
+        page_token = body.get("nextPageToken")
+        if not page_token:
+            break
+
+    unit = _find_gram_unit(data_points)
+    if not unit:
+        # Unit lists are static reference data (no secrets), safe to log.
+        listing = json.dumps(data_points, sort_keys=True)[:6000]
+        log.error("No 'gram' food measurement unit found. Unit list: %s", listing)
+        raise GoogleHealthError(
+            "Could not find a 'gram' food measurement unit in Google's unit list. "
+            f"Unit list (truncated): {listing}"
+        )
+    _unit_cache["gram"] = unit
+    return unit
+
+
+# --- the one place the Google payload is built ----------------------------
+
+def build_nutrition_payload(nutrients: dict, item_name: str, quantity_g: float,
+                            now_local: datetime, meal_type, unit_name: str) -> dict:
     """
-    tz = ZoneInfo(tz_name)
-    start_local = datetime.now(tz)
-    end_local = start_local + timedelta(minutes=1)
+    Builds the JSON body for a nutrition-log write. This is the ONLY function
+    that builds the Google payload; the server and its tests both use it.
+
+    nutrients:  dict with keys calories, protein_g, carbs_g, fat_g, fiber_g, sugar_g
+    quantity_g: grams eaten, sent as serving.amount with the gram unit
+    now_local:  timezone-aware local datetime of the entry
+    meal_type:  BREAKFAST | LUNCH | DINNER | SNACK, or None to infer from the hour
+    unit_name:  resource name of the 'gram' food measurement unit
+    """
+    if not unit_name:
+        raise ValueError("unit_name is required (serving.foodMeasurementUnit)")
+    if quantity_g is None or float(quantity_g) <= 0:
+        raise ValueError("quantity_g must be greater than 0")
+
+    meal = resolve_meal_type(meal_type, now_local)
+    end_local = now_local + timedelta(minutes=1)
 
     nutrient_list = []
     for our_key, enum_name in NUTRIENT_ENUM.items():
@@ -114,25 +224,46 @@ def write_nutrition(nutrients: dict, item_name: str, tz_name: str,
                 "quantity": {"grams": float(val)},
             })
 
-    log = {
+    nutrition_log = {
         "interval": {
-            "startTime": start_local.astimezone(ZoneInfo("UTC")).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "startUtcOffset": _offset_string(start_local),
+            "startTime": now_local.astimezone(ZoneInfo("UTC")).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "startUtcOffset": _offset_string(now_local),
             "endTime": end_local.astimezone(ZoneInfo("UTC")).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "endUtcOffset": _offset_string(end_local),
         },
         "foodDisplayName": item_name,
-        "mealType": meal_type,
+        "mealType": meal,
         "energy": {"kcal": float(nutrients.get("calories", 0))},
         "totalCarbohydrate": {"grams": float(nutrients.get("carbs_g", 0) or 0)},
         "totalFat": {"grams": float(nutrients.get("fat_g", 0) or 0)},
-        "serving": {"amount": 1.0},
+        "serving": {
+            "amount": float(quantity_g),
+            "foodMeasurementUnit": unit_name,
+        },
     }
     if nutrient_list:
-        log["nutrients"] = nutrient_list
+        nutrition_log["nutrients"] = nutrient_list
+    return {"nutritionLog": nutrition_log}
 
-    payload = {"nutritionLog": log}
+
+def write_nutrition(nutrients: dict, item_name: str, tz_name: str,
+                    quantity_g: float, meal_type=None) -> str:
+    """
+    Writes one nutrition log entry at the current local time.
+
+    nutrients: dict with keys calories, protein_g, carbs_g, fat_g, fiber_g, sugar_g
+    tz_name:   IANA timezone, e.g. "America/Toronto"
+    meal_type: BREAKFAST | LUNCH | DINNER | SNACK, or None to infer from the hour
+    Returns the created data point's resource name (used later to delete it).
+    """
+    now_local = datetime.now(ZoneInfo(tz_name))
+    payload = build_nutrition_payload(
+        nutrients, item_name, quantity_g, now_local, meal_type,
+        _resolve_gram_unit(),
+    )
     r = httpx.post(BASE, headers=_headers(), json=payload, timeout=20)
+    if r.status_code == 400:
+        _unit_cache.clear()  # in case a cached unit name went stale
     _raise_for_google(r, "nutrition write", payload)
     return r.json().get("response", {}).get("name", "")
 

@@ -1,8 +1,20 @@
 """
-Nutrition lookup: tries USDA FoodData Central first (better for whole/generic
-foods), then Open Food Facts (better for branded/packaged products).
-Returns None if neither has a match — the caller (main.py) treats that as
-a signal to ask Claude to estimate instead.
+Nutrition lookup: USDA FoodData Central (better for whole/generic foods) and
+Open Food Facts (better for branded/packaged products).
+
+The server never auto-picks a food. `search_candidates` returns up to 5
+options (USDA first, then Open Food Facts) and Claude chooses one. Each
+candidate has a stateless id ("usda:<fdcId>" or "off:<barcode>") that
+`get_candidate` re-fetches on the second log_food call.
+
+Energy is read in kcal only, never kJ. USDA labels energy as "Energy",
+"Energy (Atwater General Factors)" or "Energy (Atwater Specific Factors)", and
+some foods carry two entries called "Energy" (KCAL and kJ), so entries are
+selected by unit and nutrient number, not by name alone. Results with no kcal
+value are skipped.
+
+Any lookup failure (HTTP error, timeout, bad JSON) is retried once, logged at
+WARNING, then that source counts as "no match".
 
 Required env var:
     USDA_API_KEY   (free, from https://fdc.nal.usda.gov/api-key-signup)
@@ -18,19 +30,29 @@ log = logging.getLogger("claude-fit-logger.lookup")
 # One retry after a short pause, then the source is treated as "no match".
 RETRY_DELAY_S = 1.0
 
-USDA_SEARCH_URL = "https://api.nal.usda.gov/fdc/v1/foods/search"
-OFF_SEARCH_URL = "https://world.openfoodfacts.org/cgi/search.pl"
+MAX_CANDIDATES = 5
+USDA_SHARE = 3  # of the 5 slots, USDA gets up to 3 first; OFF gets up to 2; leftovers top up
 
-# Normalized nutrient key -> possible USDA nutrient names (USDA is inconsistent
-# across data types, so we match on a few known aliases per nutrient)
-USDA_NUTRIENT_ALIASES = {
-    "calories": ["Energy"],
-    "protein_g": ["Protein"],
-    "carbs_g": ["Carbohydrate, by difference"],
-    "fat_g": ["Total lipid (fat)"],
-    "fiber_g": ["Fiber, total dietary"],
-    "sugar_g": ["Sugars, total including NLEA", "Sugars, total"],
+USDA_SEARCH_URL = "https://api.nal.usda.gov/fdc/v1/foods/search"
+USDA_FOOD_URL = "https://api.nal.usda.gov/fdc/v1/food"
+OFF_SEARCH_URL = "https://world.openfoodfacts.org/cgi/search.pl"
+OFF_PRODUCT_URL = "https://world.openfoodfacts.org/api/v2/product"
+
+# USDA nutrient numbers, in order of preference for energy:
+# 208 = Energy (kcal), 957 = Atwater General Factors, 958 = Atwater Specific Factors.
+# 268 is energy in kJ and is never used.
+ENERGY_NUMBERS = ("208", "957", "958")
+
+# our key -> (names, numbers). Names are matched exactly, numbers as strings.
+USDA_NUTRIENTS = {
+    "protein_g": (("Protein",), ("203",)),
+    "carbs_g": (("Carbohydrate, by difference",), ("205",)),
+    "fat_g": (("Total lipid (fat)",), ("204",)),
+    "fiber_g": (("Fiber, total dietary",), ("291",)),
+    "sugar_g": (("Sugars, total including NLEA", "Sugars, total"), ("269", "269.3")),
 }
+
+NUTRIENT_KEYS = ["calories", "protein_g", "carbs_g", "fat_g", "fiber_g", "sugar_g"]
 
 
 def _get_json(source: str, url: str, **kwargs):
@@ -57,138 +79,234 @@ def _get_json(source: str, url: str, **kwargs):
     return None
 
 
-def _lookup_usda(query: str):
-    api_key = os.environ.get("USDA_API_KEY")
-    if not api_key:
+def _to_float(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
         return None
 
-    # Prefer generic/whole-food data types over Branded products, since a
-    # plain query like "chicken breast" should match the unprocessed food,
-    # not some specific packaged/prepared item that happens to share the name.
+
+# --- USDA ------------------------------------------------------------------
+
+def _normalize_usda_nutrient(n: dict) -> dict:
+    """Accepts the search format (nutrientName/nutrientNumber/unitName/value),
+    the abridged detail format (name/number/unitName/amount) and the full
+    detail format (nutrient{name,number,unitName}/amount)."""
+    inner = n.get("nutrient") if isinstance(n.get("nutrient"), dict) else {}
+    name = n.get("nutrientName") or n.get("name") or inner.get("name") or ""
+    number = n.get("nutrientNumber", n.get("number", inner.get("number", "")))
+    unit = n.get("unitName") or inner.get("unitName") or ""
+    value = n.get("value", n.get("amount"))
+    return {
+        "name": str(name),
+        "number": str(number).strip(),
+        "unit": str(unit).strip().upper(),
+        "value": _to_float(value),
+    }
+
+
+def _usda_kcal(nutrients: list):
+    """Energy in kcal, or None. Picks by unit and number so a kJ entry that is
+    also called "Energy" is never used."""
+    best = None
+    best_rank = None
+    for n in nutrients:
+        if n["value"] is None or not n["name"].lower().startswith("energy"):
+            continue
+        if n["unit"] == "KCAL":
+            pass
+        elif n["unit"] == "" and n["number"] in ENERGY_NUMBERS:
+            pass  # unit missing but the number is a kcal energy number
+        else:
+            continue  # kJ or anything else
+        rank = ENERGY_NUMBERS.index(n["number"]) if n["number"] in ENERGY_NUMBERS else len(ENERGY_NUMBERS)
+        if best_rank is None or rank < best_rank:
+            best, best_rank = n["value"], rank
+    return best
+
+
+def _usda_per_100g(food: dict):
+    """Per-100g nutrients for one USDA food, or None when it has no kcal."""
+    nutrients = [_normalize_usda_nutrient(n) for n in food.get("foodNutrients", []) if isinstance(n, dict)]
+    kcal = _usda_kcal(nutrients)
+    if kcal is None:
+        return None
+    per_100g = {"calories": kcal}
+    for our_key, (names, numbers) in USDA_NUTRIENTS.items():
+        for n in nutrients:
+            if n["value"] is None or n["unit"] not in ("G", ""):
+                continue
+            if n["name"] in names or n["number"] in numbers:
+                per_100g[our_key] = n["value"]
+                break
+    return per_100g
+
+
+def _usda_candidate(food: dict):
+    per_100g = _usda_per_100g(food)
+    fdc_id = food.get("fdcId")
+    if per_100g is None or fdc_id is None:
+        return None
+    return {
+        "id": f"usda:{fdc_id}",
+        "name": food.get("description") or "",
+        "source": "usda",
+        "data_type": food.get("dataType") or "USDA",
+        "per_100g": per_100g,
+    }
+
+
+def _usda_headers():
     # The key goes in a header, not the query string, so it never appears in
     # request URLs (httpx logs URLs at INFO, and Render keeps those logs).
-    headers = {"X-Api-Key": api_key}
+    return {"X-Api-Key": os.environ["USDA_API_KEY"]}
+
+
+def _search_usda(query: str) -> list:
+    if not os.environ.get("USDA_API_KEY"):
+        return []
+    headers = _usda_headers()
+
+    # Prefer generic/whole-food data types over Branded products, since a
+    # plain query like "chicken breast" should match the unprocessed food.
     data = _get_json(
         "USDA", USDA_SEARCH_URL,
-        params={
-            "query": query,
-            "pageSize": 5,
-            "dataType": ["Foundation", "SR Legacy"],
-        },
-        headers=headers,
-        timeout=10,
+        params={"query": query, "pageSize": MAX_CANDIDATES,
+                "dataType": ["Foundation", "SR Legacy"]},
+        headers=headers, timeout=10,
     )
     if data is None:
-        return None
-    foods = data.get("foods", [])
+        return []
+    found = [c for c in (_usda_candidate(f) for f in data.get("foods", [])) if c]
 
-    if not foods:
-        # Fall back to any data type (including Branded) if nothing generic matched.
+    if not found:
+        # Fall back to any data type (including Branded) if nothing generic was usable.
         data = _get_json(
             "USDA", USDA_SEARCH_URL,
-            params={"query": query, "pageSize": 1},
-            headers=headers,
-            timeout=10,
+            params={"query": query, "pageSize": MAX_CANDIDATES},
+            headers=headers, timeout=10,
         )
         if data is None:
-            return None
-        foods = data.get("foods", [])
+            return []
+        found = [c for c in (_usda_candidate(f) for f in data.get("foods", [])) if c]
+    return found
 
-    if not foods:
-        return None
 
-    food = foods[0]
-    nutrients_by_name = {
-        n.get("nutrientName"): n.get("value")
-        for n in food.get("foodNutrients", [])
+# --- Open Food Facts -------------------------------------------------------
+
+def _off_candidate(product: dict, fallback_name: str):
+    n = product.get("nutriments") or {}
+    kcal = _to_float(n.get("energy-kcal_100g"))
+    code = product.get("code") or product.get("_id")
+    if kcal is None or not code:
+        return None  # kcal only; never fall back to energy_100g (kJ)
+    per_100g = {
+        "calories": kcal,
+        "protein_g": _to_float(n.get("proteins_100g")),
+        "carbs_g": _to_float(n.get("carbohydrates_100g")),
+        "fat_g": _to_float(n.get("fat_100g")),
+        "fiber_g": _to_float(n.get("fiber_100g")),
+        "sugar_g": _to_float(n.get("sugars_100g")),
     }
-
-    per_100g = {}
-    for our_key, aliases in USDA_NUTRIENT_ALIASES.items():
-        for alias in aliases:
-            if alias in nutrients_by_name and nutrients_by_name[alias] is not None:
-                per_100g[our_key] = float(nutrients_by_name[alias])
-                break
-
-    if "calories" not in per_100g:
-        return None  # not usable without at least calories
-
-    return {
+    per_100g = {k: v for k, v in per_100g.items() if v is not None}
+    candidate = {
+        "id": f"off:{code}",
+        "name": product.get("product_name") or fallback_name,
+        "source": "off",
+        "data_type": "Open Food Facts",
         "per_100g": per_100g,
-        "matched_name": food.get("description", query),
-        "source": "usda",
     }
+    if product.get("brands"):
+        candidate["brand"] = product["brands"]
+    return candidate
 
 
-def _lookup_off(query: str):
+def _search_off(query: str) -> list:
     data = _get_json(
         "Open Food Facts", OFF_SEARCH_URL,
-        params={
-            "search_terms": query,
-            "search_simple": 1,
-            "action": "process",
-            "json": 1,
-            "page_size": 1,
-        },
+        params={"search_terms": query, "search_simple": 1, "action": "process",
+                "json": 1, "page_size": MAX_CANDIDATES},
         timeout=10,
         headers={"User-Agent": "claude-fit-logger/1.0"},
     )
     if data is None:
-        return None
-    products = data.get("products", [])
-    if not products:
-        return None
-
-    product = products[0]
-    n = product.get("nutriments", {})
-
-    if "energy-kcal_100g" not in n:
-        return None
-
-    per_100g = {
-        "calories": n.get("energy-kcal_100g"),
-        "protein_g": n.get("proteins_100g", 0),
-        "carbs_g": n.get("carbohydrates_100g", 0),
-        "fat_g": n.get("fat_100g", 0),
-        "fiber_g": n.get("fiber_100g", 0),
-        "sugar_g": n.get("sugars_100g", 0),
-    }
-    per_100g = {k: v for k, v in per_100g.items() if v is not None}
-
-    return {
-        "per_100g": per_100g,
-        "matched_name": product.get("product_name", query),
-        "source": "off",
-    }
+        return []
+    return [c for c in (_off_candidate(p, query) for p in data.get("products", [])) if c]
 
 
-def _safe(source: str, fn, query: str):
+# --- public API ------------------------------------------------------------
+
+def _safe(source: str, fn, *args):
     """Last-resort guard: an unexpected parsing error in one source counts as
     no match instead of crashing the tool call."""
     try:
-        return fn(query)
+        return fn(*args)
+    except Exception as e:
+        log.warning("%s lookup crashed: %s", source, type(e).__name__)
+        return [] if fn in (_search_usda, _search_off) else None
+
+
+def search_candidates(query: str) -> list:
+    """Up to 5 candidates, USDA first then Open Food Facts. Empty list when
+    neither source has a usable match (or both are down)."""
+    usda = _safe("USDA", _search_usda, query)
+    off = _safe("Open Food Facts", _search_off, query)
+    chosen = usda[:USDA_SHARE] + off[:MAX_CANDIDATES - USDA_SHARE]
+    leftovers = usda[USDA_SHARE:] + off[MAX_CANDIDATES - USDA_SHARE:]
+    chosen += leftovers[:MAX_CANDIDATES - len(chosen)]
+    # keep USDA entries ahead of OFF entries
+    return sorted(chosen, key=lambda c: 0 if c["source"] == "usda" else 1)
+
+
+def parse_candidate_id(candidate_id: str):
+    """Returns (source, raw_id). Raises ValueError for anything malformed."""
+    source, sep, raw = str(candidate_id).partition(":")
+    raw = raw.strip()
+    if sep != ":" or source not in ("usda", "off") or not raw.isdigit():
+        raise ValueError(
+            "candidate_id must look like 'usda:<number>' or 'off:<barcode>', "
+            "copied from a candidates result"
+        )
+    return source, raw
+
+
+def _get_usda_food(fdc_id: str):
+    if not os.environ.get("USDA_API_KEY"):
+        return None
+    data = _get_json(
+        "USDA", f"{USDA_FOOD_URL}/{fdc_id}",
+        params={"format": "abridged"}, headers=_usda_headers(), timeout=10,
+    )
+    return _usda_candidate(data) if isinstance(data, dict) else None
+
+
+def _get_off_product(code: str):
+    data = _get_json(
+        "Open Food Facts", f"{OFF_PRODUCT_URL}/{code}.json",
+        params={"fields": "code,product_name,brands,nutriments"},
+        headers={"User-Agent": "claude-fit-logger/1.0"}, timeout=10,
+    )
+    if not isinstance(data, dict) or not isinstance(data.get("product"), dict):
+        return None
+    product = dict(data["product"])
+    product.setdefault("code", code)
+    return _off_candidate(product, code)
+
+
+def get_candidate(candidate_id: str):
+    """Re-fetches one candidate by its stateless id. None if the source is
+    down or the food has no kcal value. Raises ValueError on a malformed id."""
+    source, raw = parse_candidate_id(candidate_id)
+    fn = _get_usda_food if source == "usda" else _get_off_product
+    try:
+        return fn(raw)
     except Exception as e:
         log.warning("%s lookup crashed: %s", source, type(e).__name__)
         return None
 
 
-def lookup_nutrition(item_name: str, quantity_g: float):
-    """
-    Returns a dict of nutrients scaled to quantity_g, or None if not found
-    in either source.
-
-    {
-        "calories": ..., "protein_g": ..., "carbs_g": ..., "fat_g": ...,
-        "fiber_g": ..., "sugar_g": ...,
-        "matched_name": "...", "source": "usda" | "off"
-    }
-    """
-    result = _safe("USDA", _lookup_usda, item_name) or _safe("Open Food Facts", _lookup_off, item_name)
-    if result is None:
-        return None
-
+def scale_candidate(candidate: dict, quantity_g: float) -> dict:
+    """Per-100g values scaled to quantity_g, with every nutrient key present."""
     scale = quantity_g / 100.0
-    scaled = {k: round(v * scale, 1) for k, v in result["per_100g"].items()}
-    scaled["matched_name"] = result["matched_name"]
-    scaled["source"] = result["source"]
-    return scaled
+    per_100g = candidate["per_100g"]
+    return {k: round(float(per_100g.get(k, 0) or 0) * scale, 1) for k in NUTRIENT_KEYS}
