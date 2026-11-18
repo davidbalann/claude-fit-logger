@@ -52,6 +52,16 @@ NUTRIENT_ENUM = {
 
 MEAL_TYPES = ("BREAKFAST", "LUNCH", "DINNER", "SNACK")
 
+# Google answers short outages with 503 UNAVAILABLE ("retry with a backoff").
+# GET calls retry on any transient status; the nutrition write retries on 503
+# only (UNAVAILABLE means the request was not processed, so a retry should not
+# create a duplicate entry; a small risk remains if a 503 arrives after Google
+# actually stored the entry).
+TRANSIENT_STATUSES = (429, 500, 502, 503, 504)
+RETRY_DELAYS_S = (1.0, 2.0)        # GET calls: up to 3 attempts
+WRITE_RETRY_DELAYS_S = (2.0, 4.0)  # nutrition write: up to 3 attempts, 503 only
+MAX_UNIT_PAGES = 50
+
 _cached_token = {"value": None, "expires_at": 0}
 _unit_cache = {}
 
@@ -75,6 +85,20 @@ def _raise_for_google(r: httpx.Response, action: str, payload=None):
     raise GoogleHealthError(
         f"Google {action} failed with HTTP {r.status_code}. Google's error body: {body}"
     )
+
+
+def _send_with_retry(send, action: str, delays, statuses) -> httpx.Response:
+    """Calls send() and retries after each delay while the response status is in
+    `statuses`. Logs each retry at WARNING (status only, nothing sensitive).
+    Returns the last response; the caller decides what to do with a failure."""
+    r = send()
+    for delay in delays:
+        if r.status_code not in statuses:
+            return r
+        log.warning("Google %s returned HTTP %s, retrying in %.0fs", action, r.status_code, delay)
+        time.sleep(delay)
+        r = send()
+    return r
 
 
 def _get_access_token() -> str:
@@ -170,12 +194,20 @@ def _resolve_gram_unit() -> str:
     headers = _headers()
     data_points = []
     page_token = None
-    for _ in range(20):
+    for _ in range(MAX_UNIT_PAGES):
         params = {"pageToken": page_token} if page_token else None
-        r = httpx.get(UNIT_BASE, headers=headers, params=params, timeout=20)
+        r = _send_with_retry(
+            lambda: httpx.get(UNIT_BASE, headers=headers, params=params, timeout=20),
+            "food measurement unit list", RETRY_DELAYS_S, TRANSIENT_STATUSES,
+        )
         _raise_for_google(r, "food measurement unit list")
         body = r.json()
-        data_points.extend(body.get("dataPoints", []))
+        page = body.get("dataPoints", [])
+        data_points.extend(page)
+        unit = _find_gram_unit(page)
+        if unit:  # stop paging as soon as gram is found
+            _unit_cache["gram"] = unit
+            return unit
         page_token = body.get("nextPageToken")
         if not page_token:
             break
@@ -261,7 +293,10 @@ def write_nutrition(nutrients: dict, item_name: str, tz_name: str,
         nutrients, item_name, quantity_g, now_local, meal_type,
         _resolve_gram_unit(),
     )
-    r = httpx.post(BASE, headers=_headers(), json=payload, timeout=20)
+    r = _send_with_retry(
+        lambda: httpx.post(BASE, headers=_headers(), json=payload, timeout=20),
+        "nutrition write", WRITE_RETRY_DELAYS_S, (503,),
+    )
     if r.status_code == 400:
         _unit_cache.clear()  # in case a cached unit name went stale
     _raise_for_google(r, "nutrition write", payload)

@@ -73,5 +73,12 @@ def fast_retries(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def fast_google_retries(monkeypatch):
+    import health_client
+    monkeypatch.setattr(health_client, "RETRY_DELAYS_S", (0, 0))
+    monkeypatch.setattr(health_client, "WRITE_RETRY_DELAYS_S", (0, 0))
+
+
+@pytest.fixture(autouse=True)
 def clean_db():
     sys.modules["db"].rows.clear()

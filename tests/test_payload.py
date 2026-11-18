@@ -140,3 +140,82 @@ def test_missing_gram_unit_raises_and_shows_list(monkeypatch):
     with pytest.raises(hc.GoogleHealthError) as exc:
         hc._resolve_gram_unit()
     assert "cup" in str(exc.value)
+
+
+UNIT_OK = {"dataPoints": [{"name": UNIT, "displayName": "gram"}]}
+UNAVAILABLE = '{"error": {"code": 503, "message": "The service is currently unavailable.", "status": "UNAVAILABLE"}}'
+CREATED = {"response": {"name": "users/me/dataTypes/nutrition-log/dataPoints/abc"}}
+
+
+def test_unit_lookup_stops_paging_at_first_match(monkeypatch):
+    hc._unit_cache.clear()
+    monkeypatch.setattr(hc, "_headers", lambda: {})
+    calls = []
+
+    def fake_get(url, **kw):
+        calls.append(kw.get("params"))
+        if len(calls) == 1:
+            return FakeResponse(200, {"dataPoints": [{"name": "u/cup", "displayName": "cup"}],
+                                      "nextPageToken": "p2"})
+        return FakeResponse(200, {"dataPoints": [{"name": UNIT, "displayName": "gram"}],
+                                  "nextPageToken": "p3"})
+
+    monkeypatch.setattr(hc.httpx, "get", fake_get)
+    assert hc._resolve_gram_unit() == UNIT
+    assert len(calls) == 2  # never asked for page 3
+
+
+def test_unit_lookup_retries_503_then_succeeds(monkeypatch):
+    hc._unit_cache.clear()
+    monkeypatch.setattr(hc, "_headers", lambda: {})
+    responses = [FakeResponse(503, text=UNAVAILABLE), FakeResponse(503, text=UNAVAILABLE),
+                 FakeResponse(200, UNIT_OK)]
+    monkeypatch.setattr(hc.httpx, "get", lambda url, **kw: responses.pop(0))
+    assert hc._resolve_gram_unit() == UNIT
+    assert not responses
+
+
+def test_unit_lookup_gives_up_after_three_503s(monkeypatch):
+    hc._unit_cache.clear()
+    monkeypatch.setattr(hc, "_headers", lambda: {})
+    calls = []
+    monkeypatch.setattr(hc.httpx, "get",
+                        lambda url, **kw: calls.append(1) or FakeResponse(503, text=UNAVAILABLE))
+    with pytest.raises(hc.GoogleHealthError) as exc:
+        hc._resolve_gram_unit()
+    assert len(calls) == 3
+    assert "UNAVAILABLE" in str(exc.value)
+
+
+def test_write_retries_503_then_succeeds(monkeypatch):
+    hc._unit_cache["gram"] = UNIT
+    monkeypatch.setattr(hc, "_headers", lambda: {})
+    responses = [FakeResponse(503, text=UNAVAILABLE), FakeResponse(503, text=UNAVAILABLE),
+                 FakeResponse(200, CREATED)]
+    monkeypatch.setattr(hc.httpx, "post", lambda url, **kw: responses.pop(0))
+    assert hc.write_nutrition(NUTRIENTS, "x", "America/Toronto", quantity_g=1).endswith("/abc")
+    assert not responses
+
+
+def test_write_gives_up_after_three_503s(monkeypatch):
+    hc._unit_cache["gram"] = UNIT
+    monkeypatch.setattr(hc, "_headers", lambda: {})
+    calls = []
+    monkeypatch.setattr(hc.httpx, "post",
+                        lambda url, **kw: calls.append(1) or FakeResponse(503, text=UNAVAILABLE))
+    with pytest.raises(hc.GoogleHealthError) as exc:
+        hc.write_nutrition(NUTRIENTS, "x", "America/Toronto", quantity_g=1)
+    assert len(calls) == 3
+    assert "UNAVAILABLE" in str(exc.value)
+
+
+@pytest.mark.parametrize("status", [400, 401, 403, 500])
+def test_write_does_not_retry_other_errors(monkeypatch, status):
+    hc._unit_cache["gram"] = UNIT
+    monkeypatch.setattr(hc, "_headers", lambda: {})
+    calls = []
+    monkeypatch.setattr(hc.httpx, "post",
+                        lambda url, **kw: calls.append(1) or FakeResponse(status, text="{}"))
+    with pytest.raises(hc.GoogleHealthError):
+        hc.write_nutrition(NUTRIENTS, "x", "America/Toronto", quantity_g=1)
+    assert len(calls) == 1
